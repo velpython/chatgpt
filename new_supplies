@@ -1,0 +1,182 @@
+from __future__ import annotations 
+from test_library.demo.Supplies._block                  import Main     as Test_Parent  # Import ancestor test 
+# from test_library._base_import                                          import Test_Backend             as Test_Parent  # Import most basic test for one-off tests
+from test_library._base_import          import loop, required_params, Logger            # Import param handling, looping, and Logger model 
+
+from time import sleep  
+from dataclasses import dataclass
+
+# Use for autocomplete during DEV
+from dut_drivers import BQ79828_VIRTUAL as DUT  
+from bench_config import BMP_Bench as Bench_Config 
+# End DEV imports 
+
+class V_Supply(Test_Parent): 
+    # @dataclass
+    class Datapoint: 
+        def __init__(self, pin:str, v_pwr:float, value:float, load:bool) -> None:
+            self.pin:str            = pin 
+            self.v_pwr:float        = v_pwr 
+            self.value:float        = value 
+            self.load:bool          = load
+    # @dataclass 
+    class Data_Processing: 
+        def __init__(self, no_load:float=None, load:list[float]=[]) -> None:
+            self.no_load: float     = no_load 
+            self.load:list[float]   = load 
+
+    """ Optional stuff
+    ### Optional overloads 
+    # def contants(test):      
+    #     ''' Optional to overload. '''   
+    #     test.DEBUG      = False         # Controls DEBUG printouts. 
+    #     test.PRINTS     = True          # Controls standard printouts. 
+    #     test.BASE_FOLDER= 'bapval'      # Directory information prior to and including this folder is excluded from printouts. 
+    ### End optional overloads
+    
+    # def define_params(test): 
+    #     ''' OPTIONAL 
+    #         Import parameter sets from driver. See syntax below.
+    #         This should contain the maximum testing set. Reduced iterations are handled on XLS loading.
+    #         Key should match the name of the arg used in test functions. 
+    #         All values should be lists/iterables. ''' 
+    #     super().define_params()
+    #     # test.params.NUM_CELL            = [x for x in test.dut.SPEC.NUM_CELL] 
+    #     # test.params.CELL                = [x for x in range(min(test.dut.SPEC.CELLS), 1+max(test.dut.SPEC.CELLS))] 
+    #     # test.params.THRESH_BITS         = [int(x, 16) for x in test.dut.PROT.OV.THR.keys()] 
+    """ 
+
+    def config_convenience_items(test): 
+        ''' Do any definition of common use items here. 
+            Vars should be test.var_name for persistence throughout test. 
+            This is run by the backend before any loops. ''' 
+        test.F_LDOIN    = test.bench.SMU.F_LDOIN 
+        test.F_POWER    = test.bench.SMU.F_POWER 
+        test.MUX        = test.bench.MUX.MAIN 
+        test.F_RAIL     = test.bench.SMU.SMU_1 
+        test.F_AUX      = {
+                            'SMU_2': test.bench.SMU.SMU_2, 
+                            'SMU_3': test.bench.SMU.SMU_3, 
+                            # 'SMU_4': test.bench.SMU.SMU_4, # Not connected by default.  
+                          } 
+        
+        test.v_pin: list[V_Supply.Datapoint] = [] # Initialize place for data storage for LDRG. 
+        test.calc_ldrg  = False 
+        for name in ['LDRG', 'LOAD_REG', 'LOAD_REGULATION']: 
+            for key, val in test.params.all.items():
+                if name in key and val: test.calc_ldrg = True 
+
+    def power_up  (test, V_PWR, **params):
+        ''' Apply power. '''
+        test.F_POWER.set_voltage(V_PWR, i_comp=0.100) 
+        test.F_POWER.set_enabled(True) 
+ 
+    def power_down(test, **params):
+        ''' Reset bench configuration and remove power. '''
+        test.MUX.disconnect_all() 
+        test.F_LDOIN.set_enabled(False) 
+        test.F_POWER.set_enabled(False) 
+        test.F_POWER.set_voltage(0, i_comp=1e-6)  
+ 
+    @loop 
+    def power_cycle(test, V_PWR, **params): 
+        ''' Optional overload of how power is cycled. Typically omit this from test-level. ''' 
+        if test.powered: test.power_down(**params) 
+        sleep(0.25) 
+        test.power_up(V_PWR, **params) 
+
+    #################################################### END overloads, BEGIN test procedure.  
+
+    @loop 
+    def config_dut(test, NUM_CELL, PIN, PWR_MODE, **params):
+        ''' Configure core functionality. ''' 
+         
+        # test.dut.PING.wake()                                                            # Wake dut. 
+        test.dut.MODE.active(timeout_dis=True)                                          # Combined functionality.
+
+        die_id          = test.dut.SPAN.DIE_ID.read()                                   # Get DIE_ID and  
+        test.log.set.unit_fields(die_id=die_id)                                         # Add DIE_ID to log.
+        
+        # test.dut.BIT.bitfield.write(NUM_CELL)                                           # Apply NUM_CELL. 
+        test.dut.CONFIG.DEV(num_cell=NUM_CELL)                                          # Apply NUM_CELL.    
+
+        # test.V_LIM      = max(eval(f'test.dut.SPEC.{PIN}.ABS_RANGE')) 
+        test.V_LIM      = {} 
+        for pin, spec in test.dut.SPEC.__dict__.items(): 
+            try:        test.V_LIM[pin] = max(spec.ABS_RANGE)                           # Get pin abs_max voltage from driver and store.
+            except:     pass 
+    
+        # if PWR_MODE in ['SLEEP']:           test.dut.BIT.GOTO_SLEEP.write()             # If testing in sleep mode, goto sleep.
+        # if PWR_MODE in ['SD', 'SHUTDOWN']:  test.dut.BIT.GOTO_SD.write()                # If testing in shutdown, goto shutdown.
+
+        if PWR_MODE in ['SLEEP']:           test.dut.MODE.sleep()                      # If testing in sleep mode, goto sleep.
+        if PWR_MODE in ['SD', 'SHUTDOWN']:  test.dut.MODE.shutdown()                    # If testing in shutdown, goto shutdown.
+
+    @loop 
+    def load_other_pins(test, PIN, **params): 
+        # MUX-able SMU loads
+        aux_loads: dict[str, float]     = {}                                            # Initialize storage for additional loads 
+        for aux_pin in ['TSREF', 'AVDD', 'DVDD', 'CVDD']:                               # Parse additional pins to be loaded. 
+            if f'LOAD_{aux_pin}' in params.keys() and aux_pin != PIN:   aux_loads[aux_pin] = params[f'LOAD_{aux_pin}']
+        
+        if len(aux_loads) > len(test.F_AUX):                                            # Check if enough SMUs are available for the additonal pins. 
+            raise V_Supply.Caught_Exception_in_Test('Not enough SMUs to perform loading.')  
+
+        for pin_name, smu_name in zip(aux_loads.keys(), test.F_AUX.keys()):             # Pair pin names and smu names into list of tuples
+            test.MUX.dev_sel.by_str_dev(smu_name).by_str(pin_name).connect.single_end() # Connect SMU as single_ended, referenced to VSS by default.
+            test.F_AUX[smu_name].set_current(-1*abs(aux_loads[pin_name]), 
+                                                v_lim=test.V_LIM[pin_name], 
+                                                meas_range=test.V_LIM[pin_name])        # Apply current load to pin. 
+            
+        # Direct SMU loads 
+        for aux_pin in ['LDOIN', ]:                                                     # Parse additional pins to be loaded.
+            if f'LOAD_{aux_pin}' in params.keys() and aux_pin != PIN:   
+                test.F_LDOIN.set_current(-1*abs(params[f'LOAD_{aux_pin}']), 
+                                                    v_lim=test.V_LIM[aux_pin], 
+                                                    meas_range=test.V_LIM[aux_pin])     # Apply current load to pin.
+    
+    @loop 
+    def procedure(test, V_PWR, PIN, LOAD, **params): 
+        ''' Required function.'''
+        if abs(LOAD) > 0: 
+            test.MUX.dev_sel.SMU_1.by_str(f'{PIN}').connect.single_end()                # Connect SMU as single_ended, referenced to VSS by default.
+            test.F_RAIL.set_current(-1*abs(LOAD), v_lim=test.V_LIM[PIN], 
+                                        meas_range=test.V_LIM[PIN])                     # Apply current load to pin. 
+        
+        # v_pin           = test.MUX.dev_sel.I_DMM.AVDD.measure.single_end() 
+        v_pin           = test.MUX.dev_sel.I_DMM.by_str(PIN).measure.single_end()       # Take voltage measurement of pin, VSS ref. 
+        
+        test.v_pin.append(V_Supply.Datapoint(pin=PIN, v_pwr=V_PWR, 
+                                    value=v_pin, load=abs(LOAD)!=0))                    # Store value for max LDRG calcs.
+
+        test.log.check.against_starfish(f'V_{PIN}', value=v_pin, meas_unit='V', 
+                                    spec_id_alias=test.info.specs.by_name(f'V_{PIN}'))  # Log value, and if SF is loaded, check against spec.
+        
+        test.print_indented(test.params.now)
+        # raise Exception('Testing exception handling.')
+  
+    def post_process(test, **kwargs): 
+        ''' Optional closeout calculations after all test iterations. '''
+        if test.calc_ldrg:
+            processing: dict[str, V_Supply.Data_Processing] = {} 
+            for datapoint in test.v_pin: 
+                if f'{datapoint.pin}|{datapoint.v_pwr}' not in processing.keys(): 
+                    processing[f'{datapoint.pin}|{datapoint.v_pwr}'] = V_Supply.Data_Processing() 
+                if  datapoint.load:     processing[f'{datapoint.pin}|{datapoint.v_pwr}'].load.append(datapoint.value)
+                else:                   processing[f'{datapoint.pin}|{datapoint.v_pwr}'].no_load = datapoint.value 
+                
+            for pin_at_pwr, data_processed in processing.items(): 
+                    pin, pwr = str(pin_at_pwr).split('|') 
+                    test.log.set.FCs(V_PWR=pwr, PIN=pin)
+                    for loaded_voltage in data_processed.load:
+                        ldrg = loaded_voltage - data_processed.no_load
+                        test.log.check.against_starfish(f'V_{pin}_LDRG', value=ldrg, meas_unit='V', 
+                                                        spec_id_alias=test.info.specs.by_name(f'V_{datapoint.pin}_LDRG'))     
+                        # Log value, and if SF is loaded, check against spec.
+                    ldrg_hi = max(data_processed.load)-data_processed.no_load 
+                    ldrg_lo = min(data_processed.load)-data_processed.no_load 
+                    test.log.value(f'V_{pin}_LDRG_MAX', value=max(abs(ldrg_hi), abs(ldrg_lo)))
+
+if __name__ == '__main__': 
+    from test_library.demo.parametric_manager import execute 
+    execute()   
