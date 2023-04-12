@@ -1,0 +1,221 @@
+def supply(log, bench, parameters, SpecID):
+   
+    temporary = True 
+    if not temporary: 
+        #import BAPbenchG03 as bench
+        # import BAPbenchH03 as bench
+        import BAPbenchJ04 as bench 
+        log = Logger.Logger()  
+
+    dev = 0
+    twobytes = 2
+    doflush =1 
+    
+    # config variables
+    enable = 1 
+    all = 0xFF
+    lpf_10Hz  = 0
+    lpf_39Hz  = 2
+    cs_dr_256 = 0
+    cs_dr_4096= 3
+    single    = 1
+    continuous= 2
+    gpio_adc_only = 2
+
+    # expected parameters
+    load_min            = parameters     ['LOAD_min']
+    load_max            = parameters     ['LOAD_max']
+    load_increment      = parameters     ['LOAD_inc']
+    rNPN_par            = parameters     ['R_NPN']
+    avdd_on             = parameters     ['AVDD_SD_ON']
+    vbatList            = eval(parameters['VBAT'])
+    rail                = parameters     ['RAIL']
+    mode                = parameters     ['MODE']
+    if 'WITH_LDRG' in parameters.keys(): 
+        with_ldrg            = parameters['WITH_LDRG']
+    else: 
+        with_ldrg            = False
+    if 'LDRG' in parameters.keys(): 
+        ldrg            = parameters     ['LDRG']
+    else: 
+        ldrg            = False
+    if 'LDRG_SPEC' in parameters.keys(): 
+        ldrg_spec       = parameters     ['LDRG_SPEC']
+    else: 
+        ldrg_spec       = None
+
+    # define all the needed channels
+    if rail == 'TSREF':
+        forceCh = 'F_TSREF_INST2'
+        forceInstr = bench.fgpio2
+        compliance = 5.5
+    elif rail == 'LDOIN':
+        forceCh = 'NONE'
+        forceInstr = bench.fldoin
+        compliance = 9.0
+    elif rail == 'AVDD':
+        forceCh = 'F_AVDD_INST2'
+        forceInstr = bench.fgpio2
+        compliance = 5.5
+    elif rail == 'DVDD':
+        forceCh = 'F_DVDD_INST2'
+        forceInstr = bench.fgpio2
+        compliance = 1.8
+    elif rail == 'REF_CAP':
+        forceCh = 'NONE'
+        forceInstr = bench.fgpio2
+        compliance = 5.0
+    
+    bench.mtx.disconnect_all()
+    bench.ftdimtx.disconnect_all()
+    bench.fbat.set_voltage(0, 0.100)    # 100mA is max to work in 100V range
+    bench.ftdimtx.connect('101,102')              # connect FTDI
+    sleep(0.1)
+    log.Add_FC('STEP', '0')
+    
+    if not(avdd_on):
+        raise ValueError('AVDD_SD_OFF is not supported in this ADC test')
+    log.Add_FC('AVDD_SD_ON', str(avdd_on))
+    log.Add_FC('R_NPN', str(rNPN_par))
+    log.Add_FC('MODE', str(mode))
+    
+    # bench.mtx.dmm_config(function = 'dcvolts', range=10, NPLC=10, autoDelay=True, autoZero=True, autoRange=True) 
+    for slight_loss_of_sanity in range(10): 
+        try: 
+            bench.mtx.matrix.errorHandler()  
+        except Exception as e: 
+            print(f'Sanity check fail: {e}') 
+    for v_bat in vbatList:
+            print('\tVBAT = '+ str(v_bat) + ' V')
+            log.Add_FC('VBAT', str(v_bat))
+            bench.fbat.set_voltage(30.0, 0.100)
+            bench.fbat.set_enabled(True)
+            bench.fvc.set_voltage (4.0, 0.000000001)
+            bench.fbat._set_meas_range('current', 0.1) 
+            bench.fbat.set_voltage(v_bat, 0.100)
+            bench.ftdimtx.connect('101,102')
+            sleep(0.1)
+            bench.bq.sendWakeup()
+            bench.bq.interface.flush(512,1)
+            sleep(0.1)
+            bench.bq.write_broadcast(rmap.DEBUG_CTRL_UNLOCK, 0xA5, 1) # unlock debug controls
+            bench.bq.write_broadcast(rmap.DEBUG_COMM_CTRL1,  0x22, 1) # CT_DIS=1 ; 
+            bench.bq.write_broadcast(rmap.DIR0_ADDR, dev, 1)           # force address to be 0
+            getDieID(log, bench, dev)
+
+            ## DEVICE CONFIGURATION
+            # fault maksing
+            bench.bq.bit_write(dev, FAULT_MSK1, all)
+            bench.bq.bit_write(dev, FAULT_MSK2, all)
+                        
+            # clear all faults
+            bench.bq.bit_write(dev, FAULT_RST1, all)
+            bench.bq.bit_write(dev, FAULT_RST2, all)
+            # config device
+            bench.bq.bit_write(dev, TSREF_EN, enable)
+
+            if mode == 'SLEEP':
+                bench.bq.bit_write(dev, GOTO_SLEEP, enable)
+            elif mode == 'SHUTDOWN':
+                bench.bq.bit_write(dev, GOTO_SHUTDOWN, enable)
+            if rail != 'REF_CAP':
+                forceInstr.set_current(-0.000000001, compliance)
+            # connect force instrument
+            if forceCh != 'NONE':
+                bench.mtx.connect(bench.mtx.relayNum(forceCh))
+            bench.mtx.dmm_config(function = 'dcvolts', range = 0, NPLC = 1, autoDelay = 'Once', autoZero = None, autoRange = False)
+
+            if ldrg or with_ldrg:
+                if rail == 'TSREF':     no_load = bench.mtx.measure(bench.mtx.relayNum('S_TSREF'), withClose=True, withOpen=True) 
+                if rail == 'LDOIN':     no_load = bench.fldoin.read_voltage() 
+                if rail == 'AVDD':      no_load = bench.mtx.measure(bench.mtx.relayNum('S_AVDD' ), withClose=True, withOpen=True)  
+                if rail == 'DVDD':      no_load = bench.mtx.measure(bench.mtx.relayNum('S_DVDD' ), withClose=True, withOpen=True) 
+                if rail == 'REF_CAP':   no_load = bench.mtx.measure(bench.mtx.relayNum('S_REFHP'), withClose=True, withOpen=True) 
+                
+            # Handle load parameters
+            if   'LOAD_TSREF' in parameters.keys(): 
+                load_tsref = parameters['LOAD_TSREF'] 
+                bench.mtx.connect(bench.mtx.relayNum('F_TSREF_INST2')) 
+                bench.fgpio2.set_current(-(load_tsref), v_compliance=5) 
+            if   'LOAD_AVDD' in parameters.keys(): 
+                load_avdd = parameters['LOAD_AVDD'] 
+                bench.mtx.connect(bench.mtx.relayNum('F_AVDD_INST1'))  # Add bench.fgpio.setAsPowerSupply() here to avoid error 1128 on FGPIO INST 1 
+                bench.fgpio.configure_as_current_source()
+                bench.fgpio.set_current(-(load_avdd), v_compliance=5.5) 
+            elif 'LOAD_DVDD' in parameters.keys(): 
+                load_dvdd = parameters['LOAD_DVDD'] 
+                bench.mtx.connect(bench.mtx.relayNum('F_DVDD_INST1')) 
+                bench.fgpio.configure_as_current_source()
+                bench.fgpio.set_current(-(load_dvdd), v_compliance=1.65) 
+
+            # loop on load
+            iload = load_min
+            while iload <= load_max:
+                # print('        setting '+str(iload) + ' A load on '+ rail + ' at ' + time.asctime(time.localtime()))
+                forceInstr.set_current((-iload), compliance) 
+                sleep(0.01)
+                ldoin_smu  = bench.fldoin.read_voltage()
+                tsref_dmm  = bench.mtx.measure(bench.mtx.relayNum('S_TSREF'), withClose=True, withOpen=True) 
+                refcap_dmm = bench.mtx.measure(bench.mtx.relayNum('S_REFHP'), withClose=True, withOpen=True) 
+                avdd_dmm   = bench.mtx.measure(bench.mtx.relayNum('S_AVDD' ), withClose=True, withOpen=True) 
+                dvdd_dmm   = bench.mtx.measure(bench.mtx.relayNum('S_DVDD' ), withClose=True, withOpen=True) 
+                forceInstr.set_current((0.0), compliance)
+
+                log.Add_FC('LDOIN', str(ldoin_smu))
+                log.Add_FC('AVDD', str(avdd_dmm))
+                log.Add_FC('LOAD', str(iload))
+                if rail == 'TSREF':
+                    tsref_dmm += (iload * 0.10625)          # Compensate for IR drop in TSREF due to 2-wire measurement.  Deprecated after 4-wire conversion.
+                    load_meas = tsref_dmm
+                if rail == 'LDOIN':     load_meas = ldoin_smu 
+                if rail == 'AVDD':      load_meas = avdd_dmm 
+                if rail == 'DVDD':      load_meas = dvdd_dmm 
+                if rail == 'REF_CAP':   load_meas = refcap_dmm 
+
+                ldrg_meas = None 
+                if   ldrg: 
+                    ldrg_meas       = load_meas-no_load                     # Prepare ldrg measurements 
+                    log.Log_Meas(   f'{rail}_ldrg', ldrg_meas)
+                elif with_ldrg:   
+                    ldrg_meas       = load_meas-no_load                      # Prepare ldrg measurements 
+                    log.Add_FC(     f'{rail}_meas',     load_meas)
+                    log.Add_FC(     f'{rail}_ldrg',     ldrg_meas)
+
+                    if ldrg_spec:
+                        log.Add_FC(     'Spec_ID',      ldrg_spec)
+                        log.Log_Meas(   f'{rail}_ldrg', ldrg_meas)
+                        log.Add_FC(     'Spec_ID',      SpecID) 
+
+                    log.Log_Meas(   f'{rail}_meas',     load_meas)
+                    log.Add_FC(     f'{rail}_ldrg',     '')
+                    log.Add_FC(     f'{rail}_meas',     '')
+                else:   
+                    log.Add_FC(     f'{rail}_ldrg',     ldrg_meas)          # Load regulation is informational only 
+                    log.Log_Meas(   f'{rail}_meas',     load_meas)
+                    log.Add_FC(     f'{rail}_ldrg',     '')
+                    
+                if ldrg_meas:   print(f'\t\t\t{rail:<12} with {iload:.6f}A load: Voltage: {load_meas:.9f}V LDRG: {ldrg_meas:.9f}V') 
+                else:           print(f'\t\t\t{rail:<12} with {iload:.6f}A load: Voltage: {load_meas:.9f}V')
+
+                log.Add_FC('LDOIN',         '')
+                log.Add_FC('AVDD',          '')
+                log.Add_FC('LOAD',          '')
+                log.Add_FC(f'{rail}_ldrg',  '')
+                iload = iload + load_increment
+
+            sleep(0.5) # cool down wait
+            # disonnect force instrument
+            if forceCh != 'NONE':
+                forceInstr.set_current(-0.000000001, compliance)
+                bench.mtx.connect(bench.mtx.relayNum(forceCh))
+
+            bench.fbat.set_voltage(0, 0.100)
+            bench.mtx.disconnect_all()
+            # bench.mtx.dmm_config() 
+            bench.mtx.dmm_config(function = 'dcvolts', range = None, NPLC = 1, autoDelay = 'Once', autoZero = None, autoRange = True)
+            log.Add_FC('VBAT',  '')
+    log.Add_FC('STEP',          '')
+    log.Add_FC('AVDD_SD_ON',    '')
+    log.Add_FC('R_NPN',         '')
+    log.Add_FC('MODE',          '')
+    # end supply
